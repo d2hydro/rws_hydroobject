@@ -1,0 +1,15 @@
+[workspace]
+name = "rws-hydroobject"
+version = "0.0.1"
+description = "HydroObjecten voor Rijkswaterstaat"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[dependencies]
+python = "3.13.*"
+geopandas = ">=1.1"
+numpy = ">=2.0"
+pandas = ">=2.0"
+pyogrio = ">=0.11"
+shapely = ">=2.1"
+ipykernel = "*"
