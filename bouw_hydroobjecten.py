@@ -2,6 +2,8 @@
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import pyogrio
+import uuid
 from shapely import force_2d
 from shapely.geometry import LineString, Point
 from shapely.ops import substring
@@ -10,18 +12,20 @@ from pathlib import Path
 
 DATA_DIR = Path(__file__).parent.joinpath("data")
 GEOMETRIES_ALLOWED = ["LineString"]
+NEN3610ID_PREFIX = "NL.WBHCODE.80.Hydroobject"
 
 # input on cloud
 fairway_osm_path = DATA_DIR.joinpath("waterway_fairway.gpkg")
 river_osm_path = DATA_DIR.joinpath("waterway_river.gpkg")
 canal_osm_path = DATA_DIR.joinpath("waterway_canal.gpkg")
 extra_lines_path = DATA_DIR.joinpath("extra_lijnen.gpkg")
+randen_path = DATA_DIR.joinpath("randen.gpkg")
 
 # input from previous step
 basins_path = DATA_DIR.joinpath("basins.gpkg")
 
 # output
-hydamo_path = DATA_DIR.joinpath("hydamo.gpkg")
+hydroobject_path = DATA_DIR.joinpath("hydroobject.gpkg")
 
 
 def snap_boundaries_to_other_line(
@@ -145,14 +149,75 @@ def split_lines_at_nearby_boundaries(
     return gpd.GeoDataFrame(records, geometry="geometry", crs=gdf.crs)
 
 
+def split_lines_at_points(
+    gdf: GeoDataFrame, points_gdf: GeoDataFrame, tolerance: float
+) -> GeoDataFrame:
+    """Split lines where a point lies on the line within tolerance."""
+    if points_gdf.empty:
+        return gdf.copy()
+
+    spatial_index = points_gdf.sindex
+    points = points_gdf.geometry.to_list()
+    records = []
+
+    for row in gdf.itertuples(index=False):
+        line = row.geometry
+        if line.is_empty or len(tuple(line.boundary.geoms)) != 2:
+            continue
+
+        minx, miny, maxx, maxy = line.bounds
+        candidate_indices = spatial_index.intersection(
+            (minx - tolerance, miny - tolerance, maxx + tolerance, maxy + tolerance)
+        )
+        split_distances = []
+
+        for point_idx in candidate_indices:
+            point = points[point_idx]
+            if point.is_empty:
+                continue
+
+            projected_distance = line.project(point)
+            if projected_distance <= tolerance or projected_distance >= (
+                line.length - tolerance
+            ):
+                continue
+
+            projected_point = line.interpolate(projected_distance)
+            if point.distance(projected_point) < tolerance:
+                split_distances.append(projected_distance)
+
+        row_data = row._asdict()
+        for segment in split_line_at_distances(line, split_distances):
+            row_data["geometry"] = segment
+            records.append(row_data.copy())
+
+    return gpd.GeoDataFrame(records, geometry="geometry", crs=gdf.crs)
+
+
 def snap_line_boundaries(
-    gdf: GeoDataFrame, tolerance: float, basin_union
+    gdf: GeoDataFrame, tolerance: float, basin_union, boundary_points_gdf: GeoDataFrame
 ) -> GeoDataFrame:
     """Snap the boundaries of a linestring geodataframe to the other boundaries, or lines within the set that are within tolerance"""
     snapped_gdf = gdf.copy()
     source_geometries = snapped_gdf.geometry.to_list()
     geometries = source_geometries.copy()
     spatial_index = gdf.sindex
+    boundary_points = boundary_points_gdf.geometry.to_list()
+    boundary_points_index = boundary_points_gdf.sindex
+
+    def boundary_on_point(point: Point) -> bool:
+        candidate_indices = boundary_points_index.intersection(
+            (
+                point.x - tolerance,
+                point.y - tolerance,
+                point.x + tolerance,
+                point.y + tolerance,
+            )
+        )
+        return any(
+            point.distance(boundary_points[idx]) < tolerance
+            for idx in candidate_indices
+        )
 
     for line_idx, line in enumerate(source_geometries):
         if line is None or line.is_empty or len(tuple(line.boundary.geoms)) != 2:
@@ -193,11 +258,21 @@ def snap_line_boundaries(
                 end_distance = end_other_distance
 
         match_count = int(start_match is not None) + int(end_match is not None)
+        start_on_boundary_point = boundary_on_point(start_pt)
+        end_on_boundary_point = boundary_on_point(end_pt)
+        keep_via_boundary_point = (
+            start_on_boundary_point
+            and basin_union.covers(end_pt)
+            or end_on_boundary_point
+            and basin_union.covers(start_pt)
+        )
         if match_count == 0:
-            geometries[line_idx] = None
+            if not keep_via_boundary_point:
+                geometries[line_idx] = None
             continue
         if match_count == 1 and not line.within(basin_union):
-            geometries[line_idx] = None
+            if not keep_via_boundary_point:
+                geometries[line_idx] = None
             continue
 
         geometries[line_idx] = snap_boundaries_to_other_line(
@@ -212,6 +287,45 @@ def snap_line_boundaries(
     return snapped_gdf
 
 
+def add_basin_names(lines_gdf: GeoDataFrame, basins_gdf: GeoDataFrame) -> GeoDataFrame:
+    """Assign basin names based on the basin with the largest overlap per line."""
+    basins_name_gdf = basins_gdf[["naam", "geometry"]].copy()
+    overlay_gdf = gpd.overlay(
+        lines_gdf[["geometry"]].reset_index(names="line_idx"),
+        basins_name_gdf,
+        how="intersection",
+        keep_geom_type=True,
+    )
+    if overlay_gdf.empty:
+        lines_gdf = lines_gdf.copy()
+        lines_gdf["naam"] = pd.NA
+        return lines_gdf
+
+    overlay_gdf["overlap_length"] = overlay_gdf.geometry.length
+    name_lookup = (
+        overlay_gdf.sort_values("overlap_length", ascending=False)
+        .drop_duplicates("line_idx")
+        .set_index("line_idx")["naam"]
+    )
+
+    lines_gdf = lines_gdf.copy()
+    lines_gdf["naam"] = lines_gdf.index.map(name_lookup)
+    return lines_gdf
+
+
+def add_hydamo_identifier_columns(lines_gdf: GeoDataFrame) -> GeoDataFrame:
+    """Populate required HyDAMO identifier columns."""
+    lines_gdf = lines_gdf.reset_index(drop=True).copy()
+    lines_gdf["objectid"] = np.arange(1, len(lines_gdf) + 1, dtype=int)
+    lines_gdf["globalid"] = [
+        "{" + str(uuid.uuid4()).upper() + "}" for _ in range(len(lines_gdf))
+    ]
+    lines_gdf["nen3610id"] = lines_gdf["objectid"].map(
+        lambda objectid: f"{NEN3610ID_PREFIX}.{objectid}"
+    )
+    return lines_gdf
+
+
 # %% read files
 
 print("read basins")
@@ -219,15 +333,27 @@ basins_gdf = gpd.read_file(basins_path, layer="ribasim_basins")
 
 print("read osm fairway")
 fairway_osm_gdf = gpd.read_file(fairway_osm_path, fid_as_index=True)
+fairway_osm_gdf["bron"] = "osm"
+fairway_osm_gdf["osm_laag"] = "fairway"
 
 print("read osm river")
 river_osm_gdf = gpd.read_file(river_osm_path, fid_as_index=True)
+river_osm_gdf["bron"] = "osm"
+river_osm_gdf["osm_laag"] = "river"
 
 print("read osm canals")
 canal_osm_gdf = gpd.read_file(canal_osm_path, fid_as_index=True)
+canal_osm_gdf["bron"] = "osm"
+canal_osm_gdf["osm_laag"] = "canal"
 
 print("read extra lijnen")
 extra_lines_gdf = gpd.read_file(extra_lines_path, fid_as_index=True)
+extra_lines_gdf["bron"] = "d2hydro"
+extra_lines_gdf["osm_id"] = pd.NA
+extra_lines_gdf["osm_laag"] = pd.NA
+
+print("read randen")
+randen_gdf = gpd.read_file(randen_path)
 
 # %% aanmaken masks
 
@@ -277,7 +403,6 @@ lines_gdf = (
 # %%
 print("osm lijnen samenvoegen met extra lijnen")
 extra_lines_gdf.rename(columns={"naam": "name"}, inplace=True)
-lines_gdf.rename(columns={"osm_id": "id"}, inplace=True)
 lines_gdf = pd.concat(
     [
         lines_gdf,
@@ -313,9 +438,36 @@ lines_gdf = pd.concat(
 )
 
 lines_gdf = split_lines_at_nearby_boundaries(lines_gdf, tolerance=0.25)
+lines_gdf = split_lines_at_points(lines_gdf, randen_gdf, tolerance=0.25)
 basin_union = basins_gdf.union_all()
-lines_gdf = snap_line_boundaries(lines_gdf, tolerance=0.25, basin_union=basin_union)
+lines_gdf = snap_line_boundaries(
+    lines_gdf,
+    tolerance=0.25,
+    basin_union=basin_union,
+    boundary_points_gdf=randen_gdf,
+)
+lines_gdf = add_basin_names(lines_gdf, basins_gdf)
+lines_gdf["categorieoppervlaktewater"] = "primair"
+lines_gdf = add_hydamo_identifier_columns(lines_gdf)
+lines_gdf = lines_gdf[
+    [
+        "globalid",
+        "nen3610id",
+        "objectid",
+        "categorieoppervlaktewater",
+        "naam",
+        "bron",
+        "osm_id",
+        "osm_laag",
+        "geometry",
+    ]
+].copy()
 
 print("write to hydamo")
-lines_gdf.rename(columns={"name": "naam"}, inplace=True)
-lines_gdf.to_file(hydamo_path, layer="hydroobject")
+pyogrio.write_dataframe(
+    lines_gdf,
+    hydroobject_path,
+    layer="hydroobject",
+    driver="GPKG",
+    layer_options={"FID": "objectid"},
+)
